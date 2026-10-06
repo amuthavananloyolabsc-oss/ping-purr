@@ -1,0 +1,36 @@
+Ping & Purr - Real Google sign-in (production)
+=========================================
+
+Windows blocked "run_windows.bat"? (normal for downloads)
+---------------------------------------------------------
+Any file downloaded from the internet carries a "downloaded" mark, so Windows
+blocks its .bat file. The app is safe and runs locally. Fix it once:
+
+1. Unzip the package to a folder.
+2. Right-click run_windows.bat -> Properties.
+3. General tab -> tick "Unblock" -> OK.
+4. Run it again. Done.
+
+Or from PowerShell:
+   Unblock-File -Path "C:\path\to\unzipped\folder\*" -Recurse
+
+The app ships with a real Google OAuth loopback flow, but it needs a
+client ID from Google to work against the real service.
+
+1. Go to https://console.cloud.google.com/apis/credentials
+2. Create a project (or reuse one) and click "Create Credentials" ->
+   "OAuth client ID".
+3. Application type: Desktop app (or Web with these redirect URIs).
+4. Add Redirect URIs:
+     http://127.0.0.1:8080/
+5. Copy the client id (ends in .apps.googleusercontent.com) and launch:
+
+   Windows (cmd):
+     set GOOGLE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+     run_windows.bat
+
+   Mac / Linux:
+     GOOGLE_CLIENT_ID=your_client_id.apps.googleusercontent.com ./run_mac.command
+
+Until you set GOOGLE_CLIENT_ID, Ping & Purr uses a friendly demo sign-in and
+stores your name locally so your pet can greet you by name.
