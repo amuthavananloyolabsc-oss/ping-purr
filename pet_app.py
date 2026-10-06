@@ -6,22 +6,37 @@ Google sign-in -> character select -> always-on-top animated pet.
 Female (Zara) and Male (Max) characters, distinct voices, daily human actions.
 """
 import json
+import io
 import math
 import os
 import platform
 import random
 import re
+import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import urllib.request
+import wave
 from tkinter import font as tkfont
 
 try:
     import requests
 except Exception:
     requests = None
+
+try:
+    import pyaudio
+except Exception:
+    pyaudio = None
+
+try:
+    import vosk
+except Exception:
+    vosk = None
 
 APP_NAME = "Ping & Purr"
 MAGENTA = "#ff00ff"
@@ -176,6 +191,259 @@ class Voice:
 
 
 voice = Voice()
+
+
+# ----------------------------------------------------------------------------
+# Pet reply (shared by chat window and voice ears)
+# ----------------------------------------------------------------------------
+def pet_reply(char, profile, text):
+    """Return a short spoken reply from the pet for a given user phrase."""
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    def _local(text):
+        low = text.lower()
+        greetings = re.findall(r"\b(hi|hello|hey|yo|hiya|namaste|good (morning|evening|afternoon)|howdy)\b", low)
+        if greetings:
+            name = (profile.get("name") or "").strip() or None
+            who = f" {name}!" if name else "!"
+            return random.choice([
+                f"Hi{who} It's me, {char['name']}.",
+                f"Hey there{who} I missed you.",
+                "Hello! Ready when you are.",
+            ])
+        if re.search(r"\b(how are you|how's it going|what'?s up|kaise ho|kya haal)\b", low):
+            return f"I'm doing great! Did you come to play?"
+        if re.search(r"\b(i love you|love you|adore you)\b", low):
+            return "Aww, I love you too! Happy tail wags."
+        if re.search(r"\b(bye|goodbye|good night|sleep well)\b", low):
+            return "Bye bye! I'll be right here when you get back."
+        if re.search(r"\b(food|eat|hungry|feed)\b", low):
+            return "Mmm, I could go for a snack! Right-click me and pick Eat."
+        if re.search(r"\b(thank|thanks|thank you)\b", low):
+            return "You're welcome! Anything for you."
+        return None
+
+    reply = _local(text)
+    if reply is not None:
+        return reply
+
+    if requests and GROQ_KEY:
+        try:
+            messages = [
+                {"role": "system",
+                 "content": char["chat_persona"]
+                 + f" The user's name is {profile.get('name') or 'friend'}. "
+                   + "Reply with one or two short spoken sentences."},
+                {"role": "user", "content": text},
+            ]
+            r = requests.post(GROQ_URL,
+                              headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                              json={"model": GROQ_MODEL, "messages": messages,
+                                    "temperature": 0.85, "max_tokens": 90}, timeout=25)
+            if r.ok:
+                reply = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                reply = re.sub(r"[*_`#|>\-]", " ", reply)
+                reply = " ".join(reply.split())
+                if reply:
+                    return reply
+        except Exception:
+            pass
+    return random.choice([
+        "Hehe, tell me more about that!",
+        "Wow, really? That's cool!",
+        "I'm listening, go on!",
+        "You make everything fun!",
+        f"Ooh {profile.get('name') or 'friend'}, you're my favorite person!",
+    ])
+
+
+# ----------------------------------------------------------------------------
+# Voice ears (live mic -> pet replies). Off by default; enable from the menu.
+# ----------------------------------------------------------------------------
+_GOOGLE_STT_URL = "http://www.google.com/speech-api/v2/recognize"
+_GOOGLE_STT_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
+
+
+def _google_stt(pcm16000, language="en-US"):
+    """Minimal Google Web Speech STT. Returns transcribed text or None."""
+    if not pcm16000:
+        return None
+    try:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm16000)
+        wav = buf.getvalue()
+        req = urllib.request.Request(
+            _GOOGLE_STT_URL + "?" + urllib.parse.urlencode({
+                "client": "chromium",
+                "lang": language,
+                "key": _GOOGLE_STT_KEY,
+                "pFilter": 0,
+            }),
+            data=wav,
+            headers={"Content-Type": "audio/x-flac; rate=16000"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for res in data.get("result", []):
+            alts = res.get("alternative") or []
+            if alts and alts[0].get("transcript"):
+                return alts[0]["transcript"].strip()
+    except Exception:
+        pass
+    return None
+
+
+class Ears:
+    """Background mic listener. Uses vosk when a model path is available,
+    otherwise falls back to Google Web Speech with a tiny built-in client."""
+
+    def __init__(self, char, profile, on_heard, model_path=None):
+        self.char = char
+        self.profile = profile
+        self.on_heard = on_heard
+        self._stop = threading.Event()
+        self._thread = None
+        self.model = None
+        if vosk and model_path and os.path.isdir(model_path):
+            try:
+                self.model = vosk.Model(model_path)
+            except Exception:
+                self.model = None
+
+    @property
+    def listening(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if pyaudio is None or self.listening:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _rms(self, data):
+        if len(data) < 2:
+            return 0.0
+        fmt = "<%dh" % (len(data) // 2)
+        try:
+            samples = struct.unpack(fmt, data)
+        except Exception:
+            return 0.0
+        if not samples:
+            return 0.0
+        s = sum(s * s for s in samples) / len(samples)
+        return s ** 0.5
+
+    def _loop(self):
+        try:
+            if self.model is not None:
+                self._loop_vosk()
+            else:
+                self._loop_google()
+        except Exception:
+            pass
+
+    def _loop_vosk(self):
+        rate = 16000
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception:
+            return
+        stream = None
+        try:
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=rate,
+                             input=True, frames_per_buffer=4000)
+            rec = vosk.KaldiRecognizer(self.model, rate)
+            while not self._stop.is_set():
+                data = stream.read(4000, exception_on_overflow=False)
+                if rec.AcceptWaveform(data):
+                    txt = json.loads(rec.Result()).get("text", "").strip()
+                    if txt:
+                        self.on_heard(txt)
+        except Exception:
+            pass
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+
+    def _loop_google(self):
+        rate = 16000
+        chunk = 1600
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception:
+            return
+        stream = None
+        try:
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=rate,
+                             input=True, frames_per_buffer=chunk)
+            # ambient noise calibration: ~1s of background
+            amb = []
+            for _ in range(int(rate / chunk)):
+                if self._stop.is_set():
+                    return
+                amb.append(self._rms(stream.read(chunk, exception_on_overflow=False)))
+            ambient = (sum(amb) / len(amb)) if amb else 0.0
+            threshold = max(350.0, ambient * 1.35)
+            while not self._stop.is_set():
+                frames = bytearray()
+                silence = 0
+                started = False
+                heard = False
+                for _ in range(int(rate * 8 / chunk)):  # max ~8s phrase
+                    if self._stop.is_set():
+                        return
+                    data = stream.read(chunk, exception_on_overflow=False)
+                    rms = self._rms(data)
+                    if not started:
+                        if rms > threshold:
+                            started = True
+                            frames.extend(data)
+                    else:
+                        if rms > threshold * 0.85:
+                            silence = 0
+                            frames.extend(data)
+                        else:
+                            silence += 1
+                            if silence > int(rate * 0.55 / chunk):
+                                break
+                            frames.extend(data)
+                    if started:
+                        heard = True
+                if heard and len(frames) >= rate:  # >= 1s of audio
+                    text = _google_stt(bytes(frames), language="en-US")
+                    if text:
+                        self.on_heard(text)
+        except Exception:
+            pass
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------------------
@@ -523,6 +791,22 @@ class PetWindow:
         threading.Thread(target=self._needs_loop, daemon=True).start()
         thr = threading.Thread(target=self._greet, daemon=True)
         thr.start()
+        self.ears = Ears(self.char, self.profile, self._heard,
+                         model_path=os.environ.get("PINGPURR_VOSK_MODEL", ""))
+        if os.environ.get("PINGPURR_EARS") == "on":
+            self.ears.start()
+
+    def _heard(self, text):
+        try:
+            self.set_state("laugh", 1.6)
+        except Exception:
+            pass
+        reply = pet_reply(self.char, self.profile, text)
+        if reply:
+            try:
+                voice.speak(reply, self.char["voice"])
+            except Exception:
+                pass
 
     def _place_screen(self):
         try:
@@ -576,6 +860,7 @@ class PetWindow:
             ("Laugh", lambda: self.do("laugh")),
             ("Sneeze", lambda: self.do("sneeze")),
             ("Chat with me", self._open_chat),
+            ("Listen / Stop listening", self._toggle_ears),
             ("Mute / Unmute", self._toggle_mute),
             ("Quit", self._do_quit),
         ]:
@@ -584,6 +869,20 @@ class PetWindow:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
+
+    def _toggle_ears(self):
+        if self.ears and self.ears.listening:
+            self.ears.stop()
+            voice.speak("Ok, going quiet.", self.char["voice"])
+        else:
+            if pyaudio is None:
+                voice.speak("Voice listening is not available on this build.", self.char["voice"])
+                return
+            self.ears.start()
+            if self.ears.listening:
+                voice.speak("I can hear you. Say hello!", self.char["voice"])
+            else:
+                voice.speak("I could not start the microphone.", self.char["voice"])
 
     def do(self, state):
         self.set_state(state, 3.0)
@@ -693,31 +992,9 @@ class ChatWindow(tk.Toplevel):
         threading.Thread(target=self._reply, args=(text,), daemon=True).start()
 
     def _reply(self, text):
-        system = self.char["chat_persona"]
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": text},
-        ]
-        reply = None
-        if requests:
-            try:
-                r = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                                  json={"model": GROQ_MODEL, "messages": messages,
-                                        "temperature": 0.85, "max_tokens": 90}, timeout=30)
-                if r.ok:
-                    reply = (r.json()["choices"][0]["message"]["content"] or "").strip()
-                    reply = re.sub(r"[*_`#|>\-]", " ", reply)
-                    reply = " ".join(reply.split())
-            except Exception as e:
-                reply = None
+        reply = pet_reply(self.char, self.profile, text)
         if not reply:
-            reply = random.choice([
-                "Hehe, tell me more about that!",
-                "Wow, really? That's cool!",
-                "I'm listening, go on!",
-                "You make everything fun!",
-                f"Ooh {self.profile.get('name') or 'friend'}, you're my favorite person!",
-            ])
+            return
         self.box.insert("end", f"[{self.char['name']}] {reply}\n\n", "pet")
         self.box.see("end")
         voice.speak(reply, self.char["voice"])

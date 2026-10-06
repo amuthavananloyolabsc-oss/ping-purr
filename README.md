@@ -42,12 +42,25 @@ Ping & Purr is a small, independent, **unsigned** app. Everything runs 100% on y
 |---|---|
 | Left-click | Hug + happy hearts |
 | Drag | Move anywhere on screen |
-| Right-click | Menu: Eat, Drink, Bath, Brush teeth, Sleep, Dance, Exercise, Laugh, Sneeze, Chat, Mute, Quit |
+| Right-click | Menu: Eat, Drink, Bath, Brush teeth, Sleep, Dance, Exercise, Laugh, Sneeze, Chat, **Listen**, Mute, Quit |
+
+### Talk to your pet
+
+Right-click the pet → **Listen / Stop listening**. The pet hears your microphone
+and replies out loud:
+
+- Online, it uses Google Web Speech (the app's only network call for voice; conversation
+  via Groq is separate and optional).
+- If the `LLM_API_KEY` env var is set (or the Groq key fails), replies are fully local.
+- To run offline with a local model: download a **vosk small en-us model**, point the
+  `PINGPURR_VOSK_MODEL` env var at its folder, and it never touches the network.
+- Reply speed depends on your mic and internet. Low volume/background noise can cause
+  silence; say "hello" clearly.
 
 ## Development
 
 ```bash
-pip install pillow   # optional
+pip install pyaudio   # needed for voice listening (pip install pyaudiowpatch on Windows)
 python pet_app.py
 ```
 
